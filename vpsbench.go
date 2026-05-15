@@ -6,12 +6,12 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"math"
 	"math/rand"
 	"net/http"
 	"os"
 	"path/filepath"
 	"runtime"
-	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -35,10 +35,18 @@ const (
 	networkWeight = 10.0
 
 	// Reference profile: a basic 1 vCPU / 1 GiB VPS scores about 1000 total.
-	baseCPUMBps     = 1000.0
-	baseMemoryGBps  = 4.0
-	baseDiskMBps    = 200.0
-	baseNetworkMbps = 100.0
+	baseCPUFloatSingleOps = 25_000_000.0
+	baseCPUFloatMultiOps  = 25_000_000.0
+	baseCPUIntOps         = 350_000_000.0
+	baseCPUHashMBps       = 1000.0
+	baseMemoryGBps        = 4.0
+	baseDiskMBps          = 200.0
+	baseNetworkMbps       = 100.0
+
+	cpuFloatSingleWeight = 35.0
+	cpuFloatMultiWeight  = 35.0
+	cpuIntWeight         = 15.0
+	cpuHashWeight        = 15.0
 )
 
 func main() {
@@ -69,10 +77,8 @@ func main() {
 	fmt.Printf("Score base : %.0f points = 1 vCPU / 1 GiB reference VPS\n", baseTotalScore)
 	fmt.Println(strings.Repeat("=", 64))
 
-	results := []result{
-		benchCPU(*duration),
-		benchMemory(*duration),
-	}
+	results := benchCPUResults(*duration)
+	results = append(results, benchMemory(*duration))
 
 	if !*skipDisk {
 		results = append(results, benchDisk(*dir, *fileMB))
@@ -85,7 +91,131 @@ func main() {
 	printResults(results)
 }
 
-func benchCPU(duration time.Duration) result {
+func benchCPUResults(duration time.Duration) []result {
+	results := []result{
+		benchCPUFloatSingle(duration),
+		benchCPUFloatMulti(duration),
+		benchCPUInt(duration),
+		benchCPUHash(duration),
+	}
+
+	total := weightedScore(results)
+	for i := range results {
+		results[i].Weight = 0
+	}
+	results = append(results, result{
+		Name:   "CPU TOTAL",
+		Value:  grade(total),
+		Note:   "combined CPU score",
+		Score:  total,
+		Weight: cpuWeight,
+	})
+	return results
+}
+
+func benchCPUFloatSingle(duration time.Duration) result {
+	ops := runFloatWorker(time.Now().Add(duration))
+	opsPerSec := float64(ops) / duration.Seconds()
+	return result{
+		Name:   "CPU float single",
+		Value:  fmt.Sprintf("%.2f M ops/s", opsPerSec/1_000_000),
+		Note:   "sqrt/mod loop, 1 worker",
+		Score:  metricScore(opsPerSec, baseCPUFloatSingleOps),
+		Weight: cpuFloatSingleWeight,
+	}
+}
+
+func benchCPUFloatMulti(duration time.Duration) result {
+	workers := runtime.GOMAXPROCS(0)
+	stopTime := time.Now().Add(duration)
+	var wg sync.WaitGroup
+	results := make(chan uint64, workers)
+
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			results <- runFloatWorker(stopTime)
+		}()
+	}
+
+	wg.Wait()
+	close(results)
+
+	var total uint64
+	for n := range results {
+		total += n
+	}
+
+	opsPerSec := float64(total) / duration.Seconds()
+	return result{
+		Name:   "CPU float multi",
+		Value:  fmt.Sprintf("%.2f M ops/s", opsPerSec/1_000_000),
+		Note:   fmt.Sprintf("sqrt/mod loop, %d workers", workers),
+		Score:  metricScore(opsPerSec, baseCPUFloatMultiOps),
+		Weight: cpuFloatMultiWeight,
+	}
+}
+
+func runFloatWorker(stopTime time.Time) uint64 {
+	count := uint64(0)
+	x := 0.0001
+	for time.Now().Before(stopTime) {
+		x += math.Sqrt(x + 1.2345)
+		x = math.Mod(x, 1000)
+		count++
+	}
+	if x == -1 {
+		fmt.Fprint(io.Discard, x)
+	}
+	return count
+}
+
+func benchCPUInt(duration time.Duration) result {
+	workers := runtime.GOMAXPROCS(0)
+	ctx, cancel := context.WithTimeout(context.Background(), duration)
+	defer cancel()
+
+	var ops uint64
+	var checksum uint64
+	var wg sync.WaitGroup
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func(seed uint64) {
+			defer wg.Done()
+			x := seed + 0x9e3779b97f4a7c15
+			localOps := uint64(0)
+			for {
+				select {
+				case <-ctx.Done():
+					atomic.AddUint64(&ops, localOps)
+					atomic.AddUint64(&checksum, x)
+					return
+				default:
+					for j := 0; j < 1024; j++ {
+						x ^= x << 13
+						x ^= x >> 7
+						x ^= x << 17
+						x *= 0xbf58476d1ce4e5b9
+					}
+					localOps += 1024
+				}
+			}
+		}(uint64(i + 1))
+	}
+	wg.Wait()
+
+	opsPerSec := float64(ops) / duration.Seconds()
+	return result{
+		Name:   "CPU integer",
+		Value:  fmt.Sprintf("%.2f M ops/s", opsPerSec/1_000_000),
+		Note:   fmt.Sprintf("bitwise/multiply mix, checksum %d", checksum),
+		Score:  metricScore(opsPerSec, baseCPUIntOps),
+		Weight: cpuIntWeight,
+	}
+}
+
+func benchCPUHash(duration time.Duration) result {
 	workers := runtime.GOMAXPROCS(0)
 	ctx, cancel := context.WithTimeout(context.Background(), duration)
 	defer cancel()
@@ -123,8 +253,8 @@ func benchCPU(duration time.Duration) result {
 		Name:   "CPU SHA256",
 		Value:  fmt.Sprintf("%.2f MB/s", mbps),
 		Note:   fmt.Sprintf("%d workers, %.0f hashes/s", workers, float64(blocks)/duration.Seconds()),
-		Score:  metricScore(mbps, baseCPUMBps),
-		Weight: cpuWeight,
+		Score:  metricScore(mbps, baseCPUHashMBps),
+		Weight: cpuHashWeight,
 	}
 }
 
@@ -298,10 +428,6 @@ func (r *contextReader) Read(p []byte) (int, error) {
 }
 
 func printResults(results []result) {
-	sort.SliceStable(results, func(i, j int) bool {
-		return results[i].Name < results[j].Name
-	})
-
 	fmt.Printf("%-18s %-48s %-10s %s\n", "Test", "Result", "Score", "Note")
 	fmt.Println(strings.Repeat("-", 108))
 	for _, r := range results {
@@ -313,8 +439,10 @@ func printResults(results []result) {
 	fmt.Printf("%-18s %-48s %-10.0f %s\n", "TOTAL", grade(total), total, fmt.Sprintf("weighted score, %.0f active weight", weight))
 	fmt.Println()
 	fmt.Println("Reference: 1000 points ~= basic 1 vCPU / 1 GiB VPS")
-	fmt.Printf("Baseline : CPU %.0f MB/s, memory %.1f GB/s, disk %.0f MB/s avg, network %.0f Mbps\n",
-		baseCPUMBps, baseMemoryGBps, baseDiskMBps, baseNetworkMbps)
+	fmt.Printf("CPU base : float single %.0f M ops/s, float multi %.0f M ops/s, integer %.0f M ops/s, SHA256 %.0f MB/s\n",
+		baseCPUFloatSingleOps/1_000_000, baseCPUFloatMultiOps/1_000_000, baseCPUIntOps/1_000_000, baseCPUHashMBps)
+	fmt.Printf("Other    : memory %.1f GB/s, disk %.0f MB/s avg, network %.0f Mbps\n",
+		baseMemoryGBps, baseDiskMBps, baseNetworkMbps)
 }
 
 func metricScore(value, baseline float64) float64 {
@@ -326,6 +454,14 @@ func metricScore(value, baseline float64) float64 {
 
 func failedResult(name string, weight float64, err error) result {
 	return result{Name: name, Value: "failed", Note: err.Error(), Weight: weight}
+}
+
+func weightedScore(results []result) float64 {
+	score, weight := totalScore(results)
+	if weight == 0 {
+		return 0
+	}
+	return score
 }
 
 func totalScore(results []result) (float64, float64) {
